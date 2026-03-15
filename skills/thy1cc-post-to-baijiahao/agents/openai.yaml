@@ -1,0 +1,4 @@
+interface:
+  display_name: "Post to Baijiahao"
+  short_description: "Publish articles to Baijiahao via browser"
+  default_prompt: "Use $thy1cc-post-to-baijiahao to publish a prepared article package to Baijiahao."
