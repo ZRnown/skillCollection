@@ -7,6 +7,9 @@ import { getBaijiahaoPageState, isBaijiahaoSessionLoggedIn } from './baijiahao-a
 import { AUTHOR_FIELD_SELECTORS, SUMMARY_FIELD_SELECTORS, TITLE_FIELD_SELECTORS } from './baijiahao-editor-locators.ts';
 import { BODY_EDITOR_SELECTORS } from './editor-candidates.ts';
 import { pickActionCandidate, type ActionCandidate } from './action-targets.ts';
+import { analyzePublishHtml } from './publish-html.ts';
+import { extractPublishHtmlFromDocument } from './publish-source.ts';
+import { analyzePreviewHtml, collectPublishExpectations, parseSaveApiResponse, type PublishExpectations } from './publish-verification.ts';
 
 const BAIJIAHAO_HOME = 'https://baijiahao.baidu.com/';
 const ACTION_TEXT_SELECTORS = 'button, a, [role="button"], div, span';
@@ -32,6 +35,46 @@ interface ExtendConfig {
   editor_url?: string;
   create_button_texts?: string;
   default_action?: string;
+}
+
+interface CapturedSaveResponse {
+  url: string;
+  status: number;
+  body: string;
+  transport: string;
+  ts: number;
+}
+
+interface ListVerificationResult {
+  statusParam: string;
+  found: boolean;
+  excerpt: string;
+}
+
+interface PreviewVerificationSummary {
+  ok: boolean;
+  titleMatched: boolean;
+  textLength: number;
+  imageCount: number;
+  url: string;
+}
+
+interface RemoteImageAsset {
+  originalSrc: string;
+  base64: string;
+  mime: string;
+  filename: string;
+}
+
+interface UploadedImageAsset {
+  originalSrc: string;
+  uploadedUrl: string;
+}
+
+interface EditorVerificationSummary {
+  ok: boolean;
+  imageCount: number;
+  url: string;
 }
 
 function printHelp(): void {
@@ -185,16 +228,113 @@ function stripTags(value: string): string {
     .trim();
 }
 
+function inferImageMimeType(imageUrl: string): string {
+  const lower = imageUrl.toLowerCase();
+  if (lower.includes('.png')) return 'image/png';
+  if (lower.includes('.webp')) return 'image/webp';
+  if (lower.includes('.gif')) return 'image/gif';
+  return 'image/jpeg';
+}
+
+function inferExtensionFromMime(mime: string): string {
+  switch (mime.toLowerCase()) {
+    case 'image/png':
+      return '.png';
+    case 'image/webp':
+      return '.webp';
+    case 'image/gif':
+      return '.gif';
+    default:
+      return '.jpg';
+  }
+}
+
+function guessImageFilename(imageUrl: string, index: number, mime: string): string {
+  try {
+    const parsed = new URL(imageUrl);
+    const pathname = parsed.pathname.split('/').filter(Boolean).pop() || '';
+    const cleanName = pathname.replace(/[^a-zA-Z0-9._-]/g, '');
+    if (cleanName && /\.[a-z0-9]+$/i.test(cleanName)) return cleanName;
+    if (cleanName) return `${cleanName}${inferExtensionFromMime(mime)}`;
+  } catch {}
+  return `baijiahao-image-${index + 1}${inferExtensionFromMime(mime)}`;
+}
+
+async function downloadRemoteImageAsset(imageUrl: string, index: number): Promise<RemoteImageAsset> {
+  const response = await fetch(imageUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to download image for Baijiahao upload: ${imageUrl} (${response.status})`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) {
+    throw new Error(`Downloaded empty image for Baijiahao upload: ${imageUrl}`);
+  }
+
+  const headerMime = (response.headers.get('content-type') || '').split(';')[0]!.trim();
+  const mime = headerMime.startsWith('image/') ? headerMime : inferImageMimeType(imageUrl);
+
+  return {
+    originalSrc: imageUrl,
+    base64: buffer.toString('base64'),
+    mime,
+    filename: guessImageFilename(imageUrl, index, mime),
+  };
+}
+
+async function uploadImageToBaijiahao(session: ChromeSession, asset: RemoteImageAsset): Promise<string> {
+  const uploadedUrl = await evaluate<string>(session, `
+    (async function() {
+      const base64 = ${JSON.stringify(asset.base64)};
+      const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+      const blob = new Blob([bytes], { type: ${JSON.stringify(asset.mime)} });
+      const form = new FormData();
+      form.append('media', blob, ${JSON.stringify(asset.filename)});
+
+      const response = await fetch('/materialui/picture/uploadProxy', {
+        method: 'POST',
+        body: form,
+        credentials: 'include',
+      });
+      const payload = JSON.parse(await response.text());
+      return payload?.ret?.https_url || payload?.ret?.bos_url || '';
+    })()
+  `);
+
+  if (!uploadedUrl) {
+    throw new Error(`Baijiahao uploadProxy returned no usable URL for ${asset.originalSrc}`);
+  }
+
+  return uploadedUrl.replace(/^http:/i, 'https:');
+}
+
+async function uploadRemoteImagesForBaijiahao(session: ChromeSession, html: string): Promise<UploadedImageAsset[]> {
+  const uniqueRemoteUrls = Array.from(new Set(
+    analyzePublishHtml(html).remoteImageUrls
+      .map((url) => url.trim())
+      .filter((url) => url && !/baijiahao\.baidu\.com\/bjh\/picproxy/i.test(url))
+  ));
+
+  const uploads: UploadedImageAsset[] = [];
+  for (let index = 0; index < uniqueRemoteUrls.length; index += 1) {
+    const asset = await downloadRemoteImageAsset(uniqueRemoteUrls[index]!, index);
+    const uploadedUrl = await uploadImageToBaijiahao(session, asset);
+    uploads.push({
+      originalSrc: asset.originalSrc,
+      uploadedUrl,
+    });
+  }
+
+  return uploads;
+}
+
 function extractPublishHtml(htmlPath: string): string {
   const content = fs.readFileSync(htmlPath, 'utf-8');
-
-  const outputMatch = content.match(/<[^>]+id=["']output["'][^>]*>([\s\S]*?)<\/[^>]+>/i);
-  if (outputMatch) return outputMatch[1]!.trim();
-
-  const bodyMatch = content.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-  if (bodyMatch) return bodyMatch[1]!.trim();
-
-  return content.trim();
+  return extractPublishHtmlFromDocument(content);
 }
 
 function markdownToHtmlFallback(markdownPath: string): string | null {
@@ -319,24 +459,38 @@ async function editorReady(session: ChromeSession): Promise<boolean> {
   const titleReady = await fieldHintsExist(session, ['标题', 'title']);
   const bodyReady = await evaluate<boolean>(session, `
     (function() {
-      const selectors = [
-        '.ProseMirror',
-        '.ql-editor',
-        '.public-DraftEditor-content',
-        '[contenteditable="true"]',
-        '[role="textbox"]'
-      ];
+      const selectors = ${JSON.stringify(BODY_EDITOR_SELECTORS)};
       return selectors.some((selector) => {
         const nodes = document.querySelectorAll(selector);
         return Array.from(nodes).some((node) => {
-          if (!(node instanceof HTMLElement)) return false;
+          if (!(node instanceof Element)) return false;
           const rect = node.getBoundingClientRect();
-          return rect.width > 300 && rect.height > 80;
+          if (node instanceof HTMLElement) {
+            const style = window.getComputedStyle(node);
+            return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 250 && rect.height > 80;
+          }
+          return rect.width > 250 && rect.height > 80;
         });
       });
     })()
   `);
-  return titleReady || bodyReady;
+  return titleReady && bodyReady;
+}
+
+async function injectHtmlWhenEditorReady(session: ChromeSession, html: string, timeoutMs = 20_000): Promise<{ ok: boolean; detail: string }> {
+  const start = Date.now();
+  let lastResult = { ok: false, detail: 'Body editor not ready yet' };
+
+  while (Date.now() - start < timeoutMs) {
+    lastResult = await injectHtml(session, html);
+    if (lastResult.ok) return lastResult;
+    if (lastResult.detail !== 'No editor candidate found' && lastResult.detail !== 'Iframe editor body unavailable') {
+      return lastResult;
+    }
+    await sleep(1_000);
+  }
+
+  return lastResult;
 }
 
 async function fillField(session: ChromeSession, hints: string[], value: string): Promise<boolean> {
@@ -520,11 +674,13 @@ async function typeIntoTextControlSelectors(session: ChromeSession, selectors: s
 }
 
 async function injectHtml(session: ChromeSession, html: string): Promise<{ ok: boolean; detail: string }> {
+  const uploadedImages = await uploadRemoteImagesForBaijiahao(session, html);
   const plainText = stripTags(html);
   return await evaluate<{ ok: boolean; detail: string }>(session, `
     (function() {
       const html = ${JSON.stringify(html)};
       const plainText = ${JSON.stringify(plainText)};
+      const uploadedImages = ${JSON.stringify(uploadedImages)};
       const selectors = ${JSON.stringify(BODY_EDITOR_SELECTORS)};
       const visible = (node) => {
         if (!(node instanceof Element)) return false;
@@ -535,6 +691,90 @@ async function injectHtml(session: ChromeSession, html: string): Promise<{ ok: b
         }
         return rect.width > 250 && rect.height > 80;
       };
+
+      const normalizeText = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+      const uploadMap = new Map(uploadedImages.map((item) => [item.originalSrc, item.uploadedUrl]));
+      const buildImageBlock = (doc, originalSrc, captionText, altText) => {
+        const uploadedUrl = uploadMap.get(originalSrc) || originalSrc;
+        const wrapper = doc.createElement('p');
+        wrapper.style.textAlign = 'center';
+
+        const img = doc.createElement('img');
+        img.setAttribute('src', uploadedUrl);
+        img.setAttribute('_src', uploadedUrl);
+        img.setAttribute('data-bjh-origin-src', uploadedUrl);
+        img.setAttribute('data-bjh-type', 'IMG');
+        if (altText) img.setAttribute('alt', altText);
+        wrapper.appendChild(img);
+
+        const nodes = [wrapper];
+        if (captionText) {
+          const caption = doc.createElement('p');
+          caption.className = 'bjh-image-caption ue_t';
+          caption.textContent = captionText;
+          nodes.push(caption);
+        }
+
+        const spacer = doc.createElement('p');
+        spacer.appendChild(doc.createElement('br'));
+        nodes.push(spacer);
+        return nodes;
+      };
+
+      const replaceNodeWithAll = (target, nodes) => {
+        if (!target || !target.parentNode || !nodes.length) return;
+        const first = nodes[0];
+        target.parentNode.replaceChild(first, target);
+        let cursor = first;
+        for (let i = 1; i < nodes.length; i += 1) {
+          cursor.parentNode.insertBefore(nodes[i], cursor.nextSibling);
+          cursor = nodes[i];
+        }
+      };
+
+      const toBaijiahaoHtml = (rawHtml) => {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString('<div id="codex-root">' + rawHtml + '</div>', 'text/html');
+        const root = doc.querySelector('#codex-root') || doc.body;
+
+        Array.from(root.querySelectorAll('figure')).forEach((figure) => {
+          const img = figure.querySelector('img');
+          if (!(img instanceof HTMLImageElement)) return;
+          const originalSrc = normalizeText(img.getAttribute('src'));
+          if (!originalSrc) return;
+          const captionText = normalizeText(figure.querySelector('figcaption')?.textContent || img.getAttribute('alt'));
+          const altText = normalizeText(img.getAttribute('alt') || captionText);
+          replaceNodeWithAll(figure, buildImageBlock(doc, originalSrc, captionText, altText));
+        });
+
+        Array.from(root.querySelectorAll('img')).forEach((imgNode) => {
+          if (!(imgNode instanceof HTMLImageElement)) return;
+          if (imgNode.closest('p')?.classList.contains('bjh-image-container')) return;
+          const originalSrc = normalizeText(imgNode.getAttribute('src'));
+          if (!originalSrc) return;
+          const captionText = normalizeText(imgNode.getAttribute('alt'));
+          const altText = normalizeText(imgNode.getAttribute('alt'));
+          const paragraphParent = imgNode.parentElement && imgNode.parentElement.tagName === 'P'
+            ? imgNode.parentElement
+            : imgNode;
+          replaceNodeWithAll(paragraphParent, buildImageBlock(doc, originalSrc, captionText, altText));
+        });
+
+        Array.from(root.querySelectorAll('figcaption')).forEach((node) => node.remove());
+        return root.innerHTML;
+      };
+
+      const editorEntry = window.$EDITORUI_V2
+        ? Object.values(window.$EDITORUI_V2).find((value) => value && typeof value === 'object' && value.editor && typeof value.editor.setContent === 'function')
+        : null;
+      const editor = editorEntry && editorEntry.editor;
+      if (editor && typeof editor.setContent === 'function') {
+        const finalHtml = toBaijiahaoHtml(html);
+        editor.setContent(finalHtml);
+        if (typeof editor.sync === 'function') editor.sync();
+        if (typeof editor.fireEvent === 'function') editor.fireEvent('contentchange');
+        return { ok: true, detail: 'Set content via editor.setContent' };
+      }
 
       const candidates = selectors
         .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
@@ -612,6 +852,258 @@ async function attachSessionToTarget(cdp: CdpConnection, targetId: string): Prom
   return { cdp, sessionId, targetId };
 }
 
+async function installSaveResponseCapture(session: ChromeSession): Promise<void> {
+  await evaluate(session, `
+    (function() {
+      const win = window;
+      win.__codexBjhSaveResponses = [];
+      if (win.__codexBjhSaveCaptureInstalled) return true;
+
+      const matchesSaveUrl = (value) => /\\/pcui\\/article\\/save(?:\\?|$)/.test(String(value || ''));
+      const record = (payload) => {
+        try {
+          const target = Array.isArray(win.__codexBjhSaveResponses) ? win.__codexBjhSaveResponses : [];
+          target.push({
+            url: String(payload.url || ''),
+            status: Number(payload.status || 0),
+            body: typeof payload.body === 'string' ? payload.body.slice(0, 200000) : '',
+            transport: String(payload.transport || ''),
+            ts: Date.now(),
+          });
+          win.__codexBjhSaveResponses = target;
+        } catch {}
+      };
+
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = async function(...args) {
+        const response = await originalFetch(...args);
+        try {
+          const request = args[0];
+          const requestUrl = typeof request === 'string'
+            ? request
+            : (request && typeof request === 'object' && 'url' in request ? String(request.url || '') : '');
+          const responseUrl = String(response.url || requestUrl || '');
+          if (matchesSaveUrl(requestUrl) || matchesSaveUrl(responseUrl)) {
+            response.clone().text()
+              .then((body) => record({ url: responseUrl, status: response.status, body, transport: 'fetch' }))
+              .catch(() => {});
+          }
+        } catch {}
+        return response;
+      };
+
+      const originalOpen = XMLHttpRequest.prototype.open;
+      const originalSend = XMLHttpRequest.prototype.send;
+
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__codexSaveUrl = typeof url === 'string' ? url : String(url || '');
+        return originalOpen.call(this, method, url, ...rest);
+      };
+
+      XMLHttpRequest.prototype.send = function(body) {
+        this.addEventListener('loadend', () => {
+          try {
+            const responseUrl = this.responseURL || this.__codexSaveUrl || '';
+            if (!matchesSaveUrl(responseUrl)) return;
+            record({
+              url: responseUrl,
+              status: this.status,
+              body: typeof this.responseText === 'string' ? this.responseText : '',
+              transport: 'xhr',
+            });
+          } catch {}
+        }, { once: true });
+        return originalSend.call(this, body);
+      };
+
+      win.__codexBjhSaveCaptureInstalled = true;
+      return true;
+    })()
+  `);
+}
+
+async function waitForCapturedSaveResponse(session: ChromeSession, timeoutMs = 20_000): Promise<CapturedSaveResponse> {
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    const latest = await evaluate<CapturedSaveResponse | null>(session, `
+      (function() {
+        const entries = Array.isArray(window.__codexBjhSaveResponses) ? window.__codexBjhSaveResponses : [];
+        if (!entries.length) return null;
+        return entries[entries.length - 1];
+      })()
+    `);
+
+    if (latest && latest.body) return latest;
+    await sleep(500);
+  }
+
+  throw new Error('No Baijiahao save API response was captured after clicking the action button.');
+}
+
+function resolveListStatusCandidates(saveStatus: string, submit: boolean): string[] {
+  const normalized = saveStatus.trim().toLowerCase();
+  if (normalized === 'draft') return ['draft'];
+  if (submit) return ['publish', 'published', 'all'];
+  return ['draft', 'all'];
+}
+
+async function verifyTitleInContentList(cdp: CdpConnection, title: string, statusParam: string): Promise<ListVerificationResult> {
+  const listUrl = `https://baijiahao.baidu.com/builder/rc/content?currentPage=1&pageSize=10&search=${encodeURIComponent(title)}&type=all&collection=&status=${encodeURIComponent(statusParam)}&startDate=&endDate=`;
+  const created = await cdp.send<{ targetId: string }>('Target.createTarget', { url: listUrl });
+  const listSession = await attachSessionToTarget(cdp, created.targetId);
+
+  try {
+    await sleep(6_000);
+    const result = await evaluate<ListVerificationResult>(listSession, `
+      (function() {
+        const text = (document.body.innerText || '').replace(/\\s+/g, ' ').trim();
+        return {
+          statusParam: ${JSON.stringify(statusParam)},
+          found: text.includes(${JSON.stringify(title)}),
+          excerpt: text.slice(0, 1200),
+        };
+      })()
+    `);
+    return result;
+  } finally {
+    await cdp.send('Target.closeTarget', { targetId: created.targetId }).catch(() => {});
+  }
+}
+
+async function verifyTitleInAnyContentList(cdp: CdpConnection, title: string, statusCandidates: string[]): Promise<ListVerificationResult[]> {
+  const results: ListVerificationResult[] = [];
+  for (const statusParam of statusCandidates) {
+    const result = await verifyTitleInContentList(cdp, title, statusParam);
+    results.push(result);
+    if (result.found) break;
+  }
+  return results;
+}
+
+async function verifyPreviewContent(cdp: CdpConnection, previewUrl: string, title: string, expectations: PublishExpectations): Promise<PreviewVerificationSummary> {
+  if (!previewUrl) {
+    return {
+      ok: false,
+      titleMatched: false,
+      textLength: 0,
+      imageCount: 0,
+      url: '',
+    };
+  }
+
+  let latest: PreviewVerificationSummary = {
+    ok: false,
+    titleMatched: false,
+    textLength: 0,
+    imageCount: 0,
+    url: previewUrl,
+  };
+
+  const created = await cdp.send<{ targetId: string }>('Target.createTarget', { url: previewUrl });
+  const previewSession = await attachSessionToTarget(cdp, created.targetId);
+
+  try {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await sleep(attempt === 0 ? 8_000 : 2_000);
+      const result = await evaluate<PreviewVerificationSummary>(previewSession, `
+        (function() {
+          const normalizedText = (document.body.innerText || '').replace(/\\s+/g, ' ').trim();
+          const contentImageUrls = Array.from(document.querySelectorAll('img'))
+            .map((img) => img.src || '')
+            .filter((url) => {
+              const normalized = String(url || '').toLowerCase();
+              if (!normalized) return false;
+              if (normalized.includes('/sys/portraith/')) return false;
+              if (normalized.includes('.svg+xml')) return false;
+              if (normalized.includes('/static/')) return false;
+              return true;
+            });
+          const figureCount = document.querySelectorAll('figure').length;
+          return {
+            ok: false,
+            titleMatched: normalizedText.includes(${JSON.stringify(title)}),
+            textLength: normalizedText.length,
+            imageCount: Math.max(contentImageUrls.length, figureCount),
+            url: location.href,
+          };
+        })()
+      `);
+
+      latest = {
+        ...result,
+        ok: result.titleMatched
+          && result.textLength >= expectations.minimumTextLength
+          && result.imageCount >= expectations.imageCount,
+      };
+
+      if (latest.ok) return latest;
+    }
+
+    const rawHtml = await evaluate<string>(previewSession, `
+      fetch(${JSON.stringify(previewUrl)}, { credentials: 'include' })
+        .then((response) => response.text())
+    `);
+    const analysis = analyzePreviewHtml(rawHtml, title);
+    return {
+      ok: analysis.titleMatched
+        && analysis.textLength >= expectations.minimumTextLength
+        && analysis.imageCount >= expectations.imageCount,
+      titleMatched: analysis.titleMatched,
+      textLength: analysis.textLength,
+      imageCount: analysis.imageCount,
+      url: previewUrl,
+    };
+  } finally {
+    await cdp.send('Target.closeTarget', { targetId: created.targetId }).catch(() => {});
+  }
+}
+
+async function verifyEditorContent(cdp: CdpConnection, articleId: string, expectations: PublishExpectations): Promise<EditorVerificationSummary> {
+  if (!articleId) {
+    return {
+      ok: expectations.imageCount === 0,
+      imageCount: 0,
+      url: '',
+    };
+  }
+
+  const editorUrl = `https://baijiahao.baidu.com/builder/rc/edit?type=news&article_id=${encodeURIComponent(articleId)}`;
+  const created = await cdp.send<{ targetId: string }>('Target.createTarget', { url: editorUrl });
+  const editorSession = await attachSessionToTarget(cdp, created.targetId);
+
+  try {
+    await sleep(8_000);
+    const result = await evaluate<EditorVerificationSummary>(editorSession, `
+      (function() {
+        const iframe = document.querySelector('iframe#ueditor_0');
+        const doc = iframe && (iframe.contentDocument || iframe.contentWindow?.document);
+        if (!doc || !doc.body) {
+          return {
+            ok: false,
+            imageCount: 0,
+            url: location.href,
+          };
+        }
+
+        const imageCount = Array.from(doc.body.querySelectorAll('img'))
+          .map((node) => node.getAttribute('src') || '')
+          .filter((src) => src && /\\/bjh\\/picproxy/i.test(src))
+          .length;
+
+        return {
+          ok: imageCount >= ${expectations.imageCount},
+          imageCount,
+          url: location.href,
+        };
+      })()
+    `);
+    return result;
+  } finally {
+    await cdp.send('Target.closeTarget', { targetId: created.targetId }).catch(() => {});
+  }
+}
+
 async function openEditor(cdp: CdpConnection, session: ChromeSession, options: PublishOptions): Promise<ChromeSession> {
   if (options.editorUrl) {
     console.log(`[baijiahao] Navigating to configured editor URL: ${options.editorUrl}`);
@@ -676,6 +1168,15 @@ async function main(): Promise<void> {
     summary = fallback.length > 100 ? `${fallback.slice(0, 97)}...` : fallback;
   }
 
+  const publishHtmlAnalysis = analyzePublishHtml(html);
+  const publishExpectations = collectPublishExpectations(html);
+  if (publishHtmlAnalysis.unsupportedImageRefs.length > 0) {
+    throw new Error(
+      `Unsupported local/non-remote images in HTML: ${publishHtmlAnalysis.unsupportedImageRefs.slice(0, 5).join(', ')}. ` +
+      'Use remote image URLs in article-publish.html before uploading to Baijiahao.'
+    );
+  }
+
   let cdp: CdpConnection;
   let chrome: ReturnType<typeof import('node:child_process').spawn> | null = null;
   let runError: unknown = null;
@@ -723,6 +1224,7 @@ async function main(): Promise<void> {
     console.log('[baijiahao] Login confirmed.');
 
     session = await openEditor(cdp, session, options);
+    await installSaveResponseCapture(session);
 
     const readyStart = Date.now();
     while (Date.now() - readyStart < 20_000) {
@@ -740,7 +1242,7 @@ async function main(): Promise<void> {
       await typeIntoTextControlSelectors(session, AUTHOR_FIELD_SELECTORS, author)
       || await fillBySelectors(session, AUTHOR_FIELD_SELECTORS, author)
     ) : false;
-    const bodyResult = await injectHtml(session, html);
+    const bodyResult = await injectHtmlWhenEditorReady(session, html);
 
     console.log(`[baijiahao] Title filled: ${titleFilled}`);
     console.log(`[baijiahao] Summary filled: ${summaryFilled}`);
@@ -757,6 +1259,44 @@ async function main(): Promise<void> {
       const clicked = await clickAction(session, ['存草稿', '保存草稿', '保存为草稿', '保存', '草稿']);
       if (!clicked) throw new Error('Draft-save button not found.');
       console.log('[baijiahao] Draft-save click dispatched.');
+    }
+
+    const capturedSave = await waitForCapturedSaveResponse(session);
+    const saveResult = parseSaveApiResponse(capturedSave.body);
+    console.log(`[baijiahao] Save response: errno=${saveResult.errno ?? 'null'} status=${saveResult.status || 'unknown'} articleId=${saveResult.articleId || '-'} nid=${saveResult.nid || '-'} transport=${capturedSave.transport}`);
+
+    if (saveResult.errno !== 0) {
+      throw new Error(`Baijiahao save API returned errno=${saveResult.errno ?? 'null'} ${saveResult.errmsg || ''}`.trim());
+    }
+
+    const listChecks = await verifyTitleInAnyContentList(cdp, title, resolveListStatusCandidates(saveResult.status, options.submit));
+    for (const result of listChecks) {
+      console.log(`[baijiahao] Content list check (${result.statusParam}): found=${result.found}`);
+    }
+
+    const previewCheck = await verifyPreviewContent(cdp, saveResult.previewUrl, title, publishExpectations);
+    if (previewCheck.url) {
+      console.log(`[baijiahao] Preview check: titleMatched=${previewCheck.titleMatched} textLength=${previewCheck.textLength}/${publishExpectations.minimumTextLength} imageCount=${previewCheck.imageCount}/${publishExpectations.imageCount} url=${previewCheck.url}`);
+    } else {
+      console.log('[baijiahao] Preview check skipped: save response did not include nid.');
+    }
+
+    const editorCheck = await verifyEditorContent(cdp, saveResult.articleId, publishExpectations);
+    if (editorCheck.url) {
+      console.log(`[baijiahao] Editor check: imageCount=${editorCheck.imageCount}/${publishExpectations.imageCount} url=${editorCheck.url}`);
+    } else {
+      console.log('[baijiahao] Editor check skipped: save response did not include article_id.');
+    }
+
+    const listVerified = listChecks.some((result) => result.found);
+    if (!listVerified && !previewCheck.ok) {
+      throw new Error(
+        'Post-save verification failed: title was not found in the content list and preview content did not meet the expected title/text/image thresholds.'
+      );
+    }
+
+    if (publishExpectations.imageCount > 0 && !editorCheck.ok) {
+      throw new Error('Post-save verification failed: reopened editor content did not contain the expected uploaded images.');
     }
 
     await sleep(3_000);
