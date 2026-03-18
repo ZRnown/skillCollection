@@ -125,13 +125,19 @@ export function collectMetricRecord(record: Record<string, string | number | und
 }
 
 export function isListHydrated(snapshot: {
+  url: string;
   bodyLength: number;
   anchorCount: number;
   articleLinkCount: number;
   hasListWord: boolean;
+  hasContentCount: boolean;
+  hasStatusTabs: boolean;
+  hasActionText: boolean;
 }): boolean {
+  if (!snapshot.url.includes('/builder/rc/content')) return false;
   if (snapshot.articleLinkCount >= 3) return true;
-  if (snapshot.hasListWord && snapshot.bodyLength >= 600) return true;
-  if (snapshot.anchorCount >= 12 && snapshot.bodyLength >= 1000) return true;
+  if (snapshot.hasContentCount && snapshot.hasStatusTabs && snapshot.hasActionText) return true;
+  if (snapshot.hasListWord && snapshot.hasContentCount && snapshot.bodyLength >= 600) return true;
+  if (snapshot.hasStatusTabs && snapshot.anchorCount >= 8 && snapshot.bodyLength >= 1000) return true;
   return false;
 }

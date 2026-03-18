@@ -1,5 +1,10 @@
 import { afterEach, expect, test } from 'bun:test';
-import { evaluate, fetchJsonDirect, getChromeSpawnOptions } from './cdp.ts';
+import {
+  evaluate,
+  fetchJsonDirect,
+  getChromeSpawnOptions,
+  pickExistingChromeDebugPort,
+} from './cdp.ts';
 
 const savedProxyEnv = {
   all_proxy: process.env.all_proxy,
@@ -79,4 +84,56 @@ test('evaluate awaits async page expressions before reading returnByValue result
     returnByValue: true,
     awaitPromise: true,
   });
+});
+
+test('pickExistingChromeDebugPort ignores headless and empty automation sessions for Baijiahao reuse', () => {
+  const port = pickExistingChromeDebugPort([
+    {
+      port: 56944,
+      version: {
+        webSocketDebuggerUrl: 'ws://127.0.0.1:56944/devtools/browser/headless',
+        userAgent: 'Mozilla/5.0 HeadlessChrome/146.0.0.0 Safari/537.36',
+      },
+      targets: [
+        { type: 'page', title: '百家号', url: 'https://baijiahao.baidu.com/builder/theme/bjh/login' },
+      ],
+    },
+    {
+      port: 54983,
+      version: {
+        webSocketDebuggerUrl: 'ws://127.0.0.1:54983/devtools/browser/playwright',
+        userAgent: 'Mozilla/5.0 Chrome/146.0.0.0 Safari/537.36',
+      },
+      targets: [],
+    },
+  ], { urlHints: ['baijiahao.baidu.com'] });
+
+  expect(port).toBeNull();
+});
+
+test('pickExistingChromeDebugPort prefers a non-headless Baijiahao page target', () => {
+  const port = pickExistingChromeDebugPort([
+    {
+      port: 60001,
+      version: {
+        webSocketDebuggerUrl: 'ws://127.0.0.1:60001/devtools/browser/other',
+        userAgent: 'Mozilla/5.0 Chrome/146.0.0.0 Safari/537.36',
+      },
+      targets: [
+        { type: 'page', title: 'GitHub', url: 'https://github.com/' },
+      ],
+    },
+    {
+      port: 60002,
+      version: {
+        webSocketDebuggerUrl: 'ws://127.0.0.1:60002/devtools/browser/bjh',
+        userAgent: 'Mozilla/5.0 Chrome/146.0.0.0 Safari/537.36',
+      },
+      targets: [
+        { type: 'page', title: '百家号', url: 'https://baijiahao.baidu.com/builder/rc/content?type=all' },
+      ],
+    },
+  ], { urlHints: ['baijiahao.baidu.com'] });
+
+  expect(port).toBe(60002);
 });

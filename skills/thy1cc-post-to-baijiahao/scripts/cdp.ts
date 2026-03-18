@@ -239,22 +239,82 @@ export async function tryConnectExisting(port: number): Promise<CdpConnection | 
   return null;
 }
 
-export async function findExistingChromeDebugPort(): Promise<number | null> {
+interface ChromeDebugTargetInfo {
+  type?: string;
+  title?: string;
+  url?: string;
+}
+
+interface ChromeDebugVersionInfo {
+  webSocketDebuggerUrl?: string;
+  'User-Agent'?: string;
+  userAgent?: string;
+}
+
+export interface ChromeDebugPortCandidate {
+  port: number;
+  version: ChromeDebugVersionInfo;
+  targets: ChromeDebugTargetInfo[];
+}
+
+function matchesAnyHint(value: string, hints: string[]): boolean {
+  const text = value.toLowerCase();
+  return hints.some((hint) => text.includes(hint.toLowerCase()));
+}
+
+export function pickExistingChromeDebugPort(
+  candidates: ChromeDebugPortCandidate[],
+  options: { urlHints?: string[] } = {},
+): number | null {
+  const hints = (options.urlHints || []).map((value) => value.trim()).filter(Boolean);
+
+  for (const candidate of candidates) {
+    const version = candidate.version || {};
+    const websocket = version.webSocketDebuggerUrl;
+    const userAgent = String(version['User-Agent'] || version.userAgent || '');
+    if (!websocket) continue;
+    if (/headlesschrome/i.test(userAgent)) continue;
+
+    const pageTargets = (candidate.targets || []).filter((target) => target.type === 'page');
+    if (pageTargets.length === 0) continue;
+
+    if (hints.length > 0) {
+      const matched = pageTargets.some((target) =>
+        matchesAnyHint(String(target.url || ''), hints) || matchesAnyHint(String(target.title || ''), hints)
+      );
+      if (!matched) continue;
+    }
+
+    return candidate.port;
+  }
+
+  return null;
+}
+
+export async function findExistingChromeDebugPort(options: { urlHints?: string[] } = {}): Promise<number | null> {
   if (process.platform !== 'darwin' && process.platform !== 'linux') return null;
   try {
     const { execSync } = await import('node:child_process');
     const cmd = process.platform === 'darwin'
-      ? `lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -i 'google\\|chrome' | awk '{print $9}' | sed 's/.*://'`
+      ? `lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -i 'google\|chrome' | awk '{print $9}' | sed 's/.*://'`
       : `ss -tlnp 2>/dev/null | grep -i chrome | awk '{print $4}' | sed 's/.*://'`;
     const output = execSync(cmd, { encoding: 'utf-8', timeout: 5_000 }).trim();
     if (!output) return null;
     const ports = output.split('\n').map((value) => parseInt(value, 10)).filter((value) => !isNaN(value) && value > 0);
+    const candidates: ChromeDebugPortCandidate[] = [];
     for (const port of ports) {
       try {
-        const version = await fetchJsonDirect<{ webSocketDebuggerUrl?: string }>(`http://127.0.0.1:${port}/json/version`);
-        if (version.webSocketDebuggerUrl) return port;
+        const version = await fetchJsonDirect<ChromeDebugVersionInfo>(`http://127.0.0.1:${port}/json/version`);
+        if (!version.webSocketDebuggerUrl) continue;
+        const targets = await fetchJsonDirect<ChromeDebugTargetInfo[]>(`http://127.0.0.1:${port}/json/list`).catch(() => []);
+        candidates.push({
+          port,
+          version,
+          targets: Array.isArray(targets) ? targets : [],
+        });
       } catch {}
     }
+    return pickExistingChromeDebugPort(candidates, options);
   } catch {}
   return null;
 }
