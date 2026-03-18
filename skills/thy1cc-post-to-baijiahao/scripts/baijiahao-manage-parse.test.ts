@@ -50,16 +50,37 @@ test('assertDeleteSafety rejects delete without explicit article target', () => 
 
 test('isListHydrated waits for article links or sufficiently hydrated body text', () => {
   expect(isListHydrated({
+    url: 'https://baijiahao.baidu.com/',
     bodyLength: 270,
     anchorCount: 2,
     articleLinkCount: 0,
     hasListWord: true,
+    hasContentCount: false,
+    hasStatusTabs: false,
+    hasActionText: false,
   })).toBe(false);
 
   expect(isListHydrated({
+    url: 'https://baijiahao.baidu.com/builder/rc/content?currentPage=1',
     bodyLength: 1310,
     anchorCount: 21,
     articleLinkCount: 8,
     hasListWord: true,
+    hasContentCount: true,
+    hasStatusTabs: true,
+    hasActionText: true,
   })).toBe(true);
+});
+
+test('isListHydrated rejects the homepage even when it contains latest-work snippets', () => {
+  expect(isListHydrated({
+    url: 'https://baijiahao.baidu.com/',
+    bodyLength: 1515,
+    anchorCount: 31,
+    articleLinkCount: 0,
+    hasListWord: true,
+    hasContentCount: false,
+    hasStatusTabs: false,
+    hasActionText: false,
+  })).toBe(false);
 });

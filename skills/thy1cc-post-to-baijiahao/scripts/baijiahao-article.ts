@@ -1241,7 +1241,7 @@ async function main(): Promise<void> {
   let chrome: ReturnType<typeof import('node:child_process').spawn> | null = null;
   let runError: unknown = null;
 
-  const portToTry = options.cdpPort ?? await findExistingChromeDebugPort();
+  const portToTry = options.cdpPort ?? await findExistingChromeDebugPort({ urlHints: ['baijiahao.baidu.com'] });
   if (portToTry) {
     const existing = await tryConnectExisting(portToTry);
     if (existing) {

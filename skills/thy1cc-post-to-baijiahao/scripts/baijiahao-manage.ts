@@ -32,6 +32,17 @@ interface ManageRuntime {
   chrome: ReturnType<typeof import('node:child_process').spawn> | null;
 }
 
+interface ListHydrationSnapshot {
+  url: string;
+  bodyLength: number;
+  anchorCount: number;
+  articleLinkCount: number;
+  hasListWord: boolean;
+  hasContentCount: boolean;
+  hasStatusTabs: boolean;
+  hasActionText: boolean;
+}
+
 function printHelp(): void {
   console.log(`Usage:
   npx -y bun baijiahao-manage.ts list [--search 关键词] [--max-pages 3] [--page-size 10]
@@ -120,7 +131,7 @@ async function openRuntime(options: ManageOptions): Promise<ManageRuntime> {
   let cdp: CdpConnection;
   let chrome: ReturnType<typeof import('node:child_process').spawn> | null = null;
 
-  const portToTry = options.cdpPort ?? await findExistingChromeDebugPort();
+  const portToTry = options.cdpPort ?? await findExistingChromeDebugPort({ urlHints: ['baijiahao.baidu.com'] });
   if (portToTry) {
     const existing = await tryConnectExisting(portToTry);
     if (existing) {
@@ -186,30 +197,77 @@ async function navigate(session: ChromeSession, url: string, slowMs: number): Pr
   await slowDown(slowMs);
 }
 
-async function waitForListHydration(session: ChromeSession, timeoutMs = 12000): Promise<void> {
+async function getListHydrationSnapshot(session: ChromeSession): Promise<ListHydrationSnapshot | null> {
+  return await evaluate<ListHydrationSnapshot | null>(session, `
+    (function() {
+      const text = (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim();
+      return {
+        url: window.location.href,
+        bodyLength: text.length,
+        anchorCount: document.querySelectorAll('a[href]').length,
+        articleLinkCount: Array.from(document.querySelectorAll('a[href]'))
+          .filter((node) => /builder\\/preview\\/s|builder\\/rc\\/edit|article_id=/.test(String(node.getAttribute('href') || '')))
+          .length,
+        hasListWord: text.includes('作品管理') && (text.includes('草稿') || text.includes('已发布')),
+        hasContentCount: /共\\s*\\d+\\s*篇/.test(text),
+        hasStatusTabs: ['全部', '已发布', '草稿'].every((label) => text.includes(label)),
+        hasActionText: text.includes('修改') && text.includes('删除'),
+      };
+    })()
+  `);
+}
+
+async function waitForListHydration(session: ChromeSession, timeoutMs = 12000): Promise<boolean> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const snapshot = await evaluate<{
-      bodyLength: number;
-      anchorCount: number;
-      articleLinkCount: number;
-      hasListWord: boolean;
-    } | null>(session, `
-      (function() {
-        const text = (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim();
-        return {
-          bodyLength: text.length,
-          anchorCount: document.querySelectorAll('a[href]').length,
-          articleLinkCount: Array.from(document.querySelectorAll('a[href]'))
-            .filter((node) => /builder\\/preview\\/s|builder\\/rc\\/edit|article_id=/.test(String(node.getAttribute('href') || '')))
-            .length,
-          hasListWord: text.includes('作品管理') && (text.includes('草稿') || text.includes('已发布')),
-        };
-      })()
-    `);
+    const snapshot = await getListHydrationSnapshot(session);
 
-    if (snapshot && isListHydrated(snapshot)) return;
+    if (snapshot && isListHydrated(snapshot)) return true;
     await sleep(500);
+  }
+
+  return false;
+}
+
+async function clickVisibleText(session: ChromeSession, exactText: string): Promise<boolean> {
+  return await evaluate<boolean>(session, `
+    (function() {
+      const norm = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+      const visible = (node) => {
+        if (!(node instanceof HTMLElement)) return false;
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 8 && rect.height > 8 && style.display !== 'none' && style.visibility !== 'hidden' && style.pointerEvents !== 'none';
+      };
+
+      const nodes = Array.from(document.querySelectorAll('a,button,[role="button"],div,span')).filter(visible);
+      const exact = nodes.find((node) => norm(node.textContent) === ${JSON.stringify(exactText)});
+      const partial = nodes.find((node) => norm(node.textContent).includes(${JSON.stringify(exactText)}));
+      const target = exact || partial;
+      if (!target) return false;
+      target.click();
+      return true;
+    })()
+  `);
+}
+
+async function ensureContentManagePage(session: ChromeSession, slowMs: number): Promise<void> {
+  const current = await getListHydrationSnapshot(session).catch(() => null);
+  if (current && isListHydrated(current)) return;
+
+  await navigate(session, BAIJIAHAO_HOME, slowMs);
+  await assertNoRiskChallenge(session);
+  await slowDown(Math.max(800, Math.floor(slowMs * 0.6)));
+  await clickVisibleText(session, '内容管理').catch(() => false);
+  await slowDown(Math.max(700, Math.floor(slowMs * 0.5)));
+  const clicked = await clickVisibleText(session, '作品管理');
+  if (!clicked) {
+    throw new Error('Unable to open 百家号作品管理 page from the logged-in homepage.');
+  }
+
+  const hydrated = await waitForListHydration(session, 15000);
+  if (!hydrated) {
+    throw new Error('作品管理 page did not finish hydrating after sidebar navigation.');
   }
 }
 
@@ -244,6 +302,12 @@ async function collectListPageItems(session: ChromeSession): Promise<BaijiahaoAr
   return await evaluate<BaijiahaoArticleItem[]>(session, `
     (function() {
       const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+      const visible = (node) => {
+        if (!(node instanceof HTMLElement)) return false;
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 8 && rect.height > 8 && style.display !== 'none' && style.visibility !== 'hidden';
+      };
 
       const parseIdFromUrl = (href, key) => {
         try {
@@ -277,21 +341,18 @@ async function collectListPageItems(session: ChromeSession): Promise<BaijiahaoAr
         return output;
       };
 
-      const anchors = Array.from(document.querySelectorAll('a[href]'))
-        .filter((node) => {
-          const href = String(node.getAttribute('href') || '');
-          return /article_id=|builder\\\\/preview\\\\/s|builder\\\\/rc\\\\/edit/.test(href);
-        });
-
       const map = new Map();
-      for (const anchor of anchors) {
-        const href = anchor.href || '';
+      const rows = Array.from(document.querySelectorAll('.client_pages_content_v2_components_articleItem, .article-item, tr, li'))
+        .filter(visible);
+
+      for (const row of rows) {
+        const titleAnchor = row.querySelector('a[href*="/builder/preview/s"], a[href*="/s?id="], a[href*="article_id="], a[href*="/builder/rc/edit"]');
+        const href = titleAnchor ? String(titleAnchor.href || '') : '';
         const articleId = parseIdFromUrl(href, 'article_id');
         const nid = parseIdFromUrl(href, 'id');
-        const row = anchor.closest('tr,li,.article-item,[class*="item"],[class*="list"],[class*="row"]') || anchor.parentElement || anchor;
-        const rowText = normalize(row ? row.textContent : anchor.textContent);
-        const titleNode = row ? row.querySelector('h1,h2,h3,h4,.title,[class*="title"]') : null;
-        const title = normalize((titleNode && titleNode.textContent) || anchor.textContent);
+        const rowText = normalize(row.textContent);
+        const titleNode = row.querySelector('h1,h2,h3,h4,.title,[class*="title"]');
+        const title = normalize((titleAnchor && titleAnchor.textContent) || (titleNode && titleNode.textContent));
         const key = articleId || nid || href;
         if (!key || !title) continue;
 
@@ -318,22 +379,40 @@ async function collectListPageItems(session: ChromeSession): Promise<BaijiahaoAr
   `);
 }
 
+async function waitForStableListItems(session: ChromeSession, timeoutMs = 12000): Promise<BaijiahaoArticleItem[]> {
+  const started = Date.now();
+  let lastArray: BaijiahaoArticleItem[] = [];
+
+  while (Date.now() - started < timeoutMs) {
+    const result = await collectListPageItems(session).catch(() => []);
+    if (Array.isArray(result)) {
+      lastArray = result;
+      if (result.length > 0) return result;
+    }
+    await sleep(500);
+  }
+
+  return lastArray;
+}
+
 async function collectListPages(session: ChromeSession, options: ManageOptions): Promise<BaijiahaoArticleItem[]> {
   const seen = new Set<string>();
   const collected: BaijiahaoArticleItem[] = [];
 
+  await ensureContentManagePage(session, options.slowMs);
+
   for (let page = 1; page <= options.maxPages; page += 1) {
     await navigate(session, buildListUrl(options, page), options.slowMs);
     await assertNoRiskChallenge(session);
-    await waitForListHydration(session);
-    let pageItems = await collectListPageItems(session);
-    if (!Array.isArray(pageItems)) {
-      await sleep(1500);
-      pageItems = await collectListPageItems(session);
+    let hydrated = await waitForListHydration(session);
+    if (!hydrated) {
+      await ensureContentManagePage(session, options.slowMs);
+      await navigate(session, buildListUrl(options, page), options.slowMs);
+      await assertNoRiskChallenge(session);
+      hydrated = await waitForListHydration(session);
     }
-    if (!Array.isArray(pageItems)) {
-      throw new Error('List page did not return a usable article array after hydration.');
-    }
+    if (!hydrated) break;
+    const pageItems = await waitForStableListItems(session);
     if (!pageItems.length) break;
 
     let newCount = 0;
