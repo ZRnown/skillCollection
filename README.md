@@ -23,6 +23,10 @@ Portable Codex/OpenClaw skills.
   - GitHub Weekly Trending 卡片生成技能（封面 + 项目详情页）
   - 支持在线抓取周榜数据或读取本地 JSON 数据
   - 输出 `html/png/manifest/sources/summary`，可直接用于发布
+- `skills/old-book-xiaohongshu-layout`
+  - 旧书纸张质感的小红书排版技能
+  - 自带背景图、汇文明朝字体和本地 Python 渲染脚本
+  - 适合书摘、句子卡、情绪向短文配图
 
 ## Install
 
@@ -35,6 +39,7 @@ cp -R skills/thy1cc-post-to-toutiaohao "$HOME/.codex/skills/"
 cp -R skills/thy1cc-post-to-neteasehao "$HOME/.codex/skills/"
 cp -R skills/thy1cc-post-to-qiehao "$HOME/.codex/skills/"
 cp -R skills/github-weekly-trending-cards "$HOME/.codex/skills/"
+cp -R skills/old-book-xiaohongshu-layout "$HOME/.codex/skills/"
 ```
 
 Then create one of these config files:

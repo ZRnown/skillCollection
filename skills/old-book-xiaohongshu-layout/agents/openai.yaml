@@ -1,0 +1,4 @@
+interface:
+  display_name: "Old Book Xiaohongshu Layout"
+  short_description: "Render old-book style Xiaohongshu quote images"
+  default_prompt: "Use $old-book-xiaohongshu-layout to render this Chinese copy into an old-book-style Xiaohongshu image with the bundled background and font."
