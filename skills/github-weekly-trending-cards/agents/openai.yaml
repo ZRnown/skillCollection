@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Weekly Trending Cards"
+  short_description: "Generate weekly GitHub trending poster cards"
+  default_prompt: "Use $github-weekly-trending-cards to generate a weekly GitHub trending cover plus project detail card set."

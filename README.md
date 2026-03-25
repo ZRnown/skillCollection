@@ -19,6 +19,10 @@ Portable Codex/OpenClaw skills.
   - Browser-driven Qiehao draft posting skill
   - Supports `--probe-only` login/editor checks plus real draft saving through the live editor
   - Reuses a logged-in Chrome debugging session when available
+- `skills/github-weekly-trending-cards`
+  - GitHub Weekly Trending 卡片生成技能（封面 + 项目详情页）
+  - 支持在线抓取周榜数据或读取本地 JSON 数据
+  - 输出 `html/png/manifest/sources/summary`，可直接用于发布
 
 ## Install
 
@@ -30,6 +34,7 @@ cp -R skills/thy1cc-post-to-baijiahao "$HOME/.codex/skills/"
 cp -R skills/thy1cc-post-to-toutiaohao "$HOME/.codex/skills/"
 cp -R skills/thy1cc-post-to-neteasehao "$HOME/.codex/skills/"
 cp -R skills/thy1cc-post-to-qiehao "$HOME/.codex/skills/"
+cp -R skills/github-weekly-trending-cards "$HOME/.codex/skills/"
 ```
 
 Then create one of these config files:
