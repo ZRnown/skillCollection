@@ -15,6 +15,10 @@ Portable Codex/OpenClaw skills.
 - `skills/thy1cc-post-to-neteasehao`
   - Browser-driven Netease Hao creator management skill
   - Supports slow, page-led `list` / `get` / `delete` operations with explicit delete confirmation
+- `skills/thy1cc-post-to-qiehao`
+  - Browser-driven Qiehao draft posting skill
+  - Supports `--probe-only` login/editor checks plus real draft saving through the live editor
+  - Reuses a logged-in Chrome debugging session when available
 
 ## Install
 
@@ -25,6 +29,7 @@ mkdir -p "$HOME/.codex/skills"
 cp -R skills/thy1cc-post-to-baijiahao "$HOME/.codex/skills/"
 cp -R skills/thy1cc-post-to-toutiaohao "$HOME/.codex/skills/"
 cp -R skills/thy1cc-post-to-neteasehao "$HOME/.codex/skills/"
+cp -R skills/thy1cc-post-to-qiehao "$HOME/.codex/skills/"
 ```
 
 Then create one of these config files:

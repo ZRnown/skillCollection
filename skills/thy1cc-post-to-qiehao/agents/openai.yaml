@@ -1,0 +1,4 @@
+interface:
+  display_name: "Post to Qiehao"
+  short_description: "Browser-led Qiehao draft saving through the real editor"
+  default_prompt: "Use $thy1cc-post-to-qiehao to verify Qiehao login state, reach the live editor, and save a draft article through the real Chrome session."
